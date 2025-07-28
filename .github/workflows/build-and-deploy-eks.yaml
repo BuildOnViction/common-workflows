@@ -1,0 +1,236 @@
+name: Build and deploy to EKS
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: false
+        type: string
+        default: ap-southeast-1
+
+      ci_iam_role_name:
+        required: false
+        default: github-actions-ci
+        type: string
+        description: "IAM role to assume for GitHub Actions CI. Should have permissions to push to ECR and access CodeArtifact."
+
+      project:
+        required: true
+        type: string
+        description: "Name of the project, used for tagging and identification."
+
+      service:
+        required: true
+        type: string
+        description: "Name of the service, used for tagging and identification."
+
+      dockerfile_path:
+        required: false
+        type: string
+        default: ./Dockerfile
+
+      context:
+        required: false
+        type: string
+        default: .
+      
+      install_private_package:
+        required: false
+        type: string
+        default: "false"
+        description: "Set to true if you want to install private packages from CodeArtifact."
+        
+      codeartifact_repository:
+        required: false
+        description: "CodeArtifact repository to use for private packages."
+        type: string
+        default: ""
+
+      build_args:
+        required: false
+        type: string
+        default: ""
+        description: "Additional build arguments for Docker build."
+
+      notify_user_list:
+        description: "List of users to notify for secret scan"
+        required: false
+        default: ""
+        type: string
+
+    secrets:
+      GH_COMMITTER_APP_PRIVATE_KEY:
+        required: true
+      GITLEAKS_LICENSE:
+        required: true
+
+jobs:
+  secret-scan:
+    uses: BuildOnViction/common-workflows/.github/workflows/gitleaks.yaml@main
+    with:
+      notify_user_list: ${{ inputs.notify_user_list }}
+    secrets:
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  build-and-push:
+    needs: secret-scan
+    runs-on: [ self-hosted, Linux ]
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      INSTALL_PRIVATE_PACKAGE: ${{ inputs.install_private_package }}
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      environment: ${{ steps.env_vars.outputs.environment }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set env vars based on branch
+        id: env_vars
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF}" == "refs/heads/production" || "${GITHUB_REF}" == "refs/heads/mainnet-v2" ]]; then
+            export AWS_ACCOUNT_ID=249318657173
+            echo "AWS_ACCOUNT_ID=249318657173" >> $GITHUB_ENV # Coin98 Production Account ID
+            echo "CODEARTIFACT_DOMAIN=c98-prd" >> $GITHUB_ENV
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            export AWS_ACCOUNT_ID=751062111139
+            echo "AWS_ACCOUNT_ID=751062111139" >> $GITHUB_ENV # Coin98 Staging Account ID
+            echo "CODEARTIFACT_DOMAIN=c98-stg" >> $GITHUB_ENV
+            echo "environment=stag" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID"
+          echo "arn:aws:iam::$AWS_ACCOUNT_ID:role/${{ inputs.ci_iam_role_name }}"
+
+          echo "role=arn:aws:iam::$AWS_ACCOUNT_ID:role/${{ inputs.ci_iam_role_name }}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env_vars.outputs.role }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag (short SHA)
+        id: vars
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "image_tag=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Short SHA: $SHORT_SHA"
+
+      - name: Generate GitHub App token # build-and-push job running on self-hosted runner so we need to generate a token to access private repositories separately
+        id: generate_token
+        uses: BuildOnViction/common-workflows/actions/github-app-token@main
+        with:
+          app_id: 1438246 # GH Committer App ID
+          installation_id: 72358338 # GH Committer App Installation ID
+          private_key: ${{ secrets.GH_COMMITTER_APP_PRIVATE_KEY }} # Organization secret
+
+      - name: Get CodeArtifact auth token and write .npmrc
+        if: env.INSTALL_PRIVATE_PACKAGE == 'true'
+        run: |
+          DOMAIN="${CODEARTIFACT_DOMAIN}"
+          REPO="${{ inputs.codeartifact_repository }}"
+          REGION="${{ inputs.aws_region }}"
+          
+          # Get token and endpoint
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain $DOMAIN \
+            --domain-owner $AWS_ACCOUNT_ID \
+            --region $REGION \
+            --query authorizationToken \
+            --output text)
+
+          ENDPOINT=$(aws codeartifact get-repository-endpoint \
+            --domain $DOMAIN \
+            --domain-owner $AWS_ACCOUNT_ID \
+            --repository $REPO \
+            --format npm \
+            --region $REGION \
+            --query repositoryEndpoint \
+            --output text)
+
+          echo "registry=$ENDPOINT" > .npmrc
+          echo "//$(echo $ENDPOINT | cut -d/ -f3)/:_authToken=$TOKEN" >> .npmrc
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile_path }}
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.project }}-${{ inputs.service }}:${{ steps.vars.outputs.image_tag }}
+          build-args: ${{ inputs.build_args }}
+          secrets: |
+            github_token=${{ steps.generate_token.outputs.token }}
+
+  update-argocd-image-tag:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate GitHub App token
+        id: generate_token
+        uses: BuildOnViction/common-workflows/actions/github-app-token@main
+        with:
+          app_id: 1438246 # GH Committer App ID
+          installation_id: 72358338 # GH Committer App Installation ID
+          private_key: ${{ secrets.GH_COMMITTER_APP_PRIVATE_KEY }} # Organization secret
+
+      - name: Install yq
+        run: |
+          YQ_VERSION=v4.42.1
+          wget -q https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      - name: Commit to coin98/argocd-tags repo
+        run: |  
+          set -e        
+          git config --global user.email "ci-bot@coin98.com"
+          git config --global user.name "GitHub Actions Bot"
+          git clone https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/coin98/argocd-tags
+          
+          echo "Cloned argocd-tags repository successfully"
+          cd argocd-tags
+
+          if [[ "${GITHUB_REF}" == "refs/heads/preproduction" || "${GITHUB_REF}" == "refs/heads/preprod" ]]; then
+            ENV="preprod"
+          else
+            ENV="${{ needs.build-and-push.outputs.environment }}"
+          fi
+          echo "ENV is set to: $ENV"
+
+          TARGET_FILE="${{ inputs.project }}/${{ inputs.service }}/$ENV/tag.yaml"
+
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "File $TARGET_FILE does not exist. Creating it."
+            mkdir -p ${{ inputs.project }}/${{ inputs.service }}/$ENV
+            echo "image:" > $TARGET_FILE
+          else
+            echo "File $TARGET_FILE exists. Proceeding to update it."
+          fi
+          
+          echo -e 'yq ".image.tag = \"${{ needs.build-and-push.outputs.image_tag }}\"" -i $TARGET_FILE'
+          yq ".image.tag = \"${{ needs.build-and-push.outputs.image_tag }}\"" -i $TARGET_FILE
+
+          git add $TARGET_FILE
+
+          # Only commit if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "Update image tag for ${{ inputs.project }}/${{ inputs.service }}/$ENV to ${{ needs.build-and-push.outputs.image_tag }}"
+            git push origin main
+          else
+            echo "Nothing to commit."
+          fi

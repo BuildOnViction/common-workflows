@@ -1,0 +1,249 @@
+name: "Generate GitHub App Installation Token"
+description: "Generates an installation token for GitHub App (cross-org)"
+inputs:
+  app_id:
+    required: true
+    description: "GitHub App ID"
+  private_key:
+    required: true
+    description: "GitHub App private key"
+  installation_id:
+    required: true
+    description: "GitHub App installation ID"
+
+outputs:
+  token:
+    description: "GitHub App installation token"
+    value: ${{ steps.token.outputs.token }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check runner environment
+      shell: bash
+      run: |
+        echo "Runner OS: $RUNNER_OS"
+        echo "Runner Architecture: $RUNNER_ARCH"
+        echo "Current user: $(whoami)"
+        echo "User ID: $(id)"
+        echo "Python version:"
+        python3 --version || echo "python3 not found"
+        python --version || echo "python not found"
+        which python3 || echo "python3 not in PATH"
+        which python || echo "python not in PATH"
+        echo "Package managers:"
+        which pip3 || echo "pip3 not found"
+        which pip || echo "pip not found"
+
+    - name: Setup Python environment
+      shell: bash
+      run: |
+        set -e
+        
+        # Determine available Python command
+        if command -v python3 >/dev/null 2>&1; then
+          PYTHON_CMD="python3"
+          echo "✅ Using python3: $(python3 --version)"
+        elif command -v python >/dev/null 2>&1; then
+          PYTHON_CMD="python"
+          echo "✅ Using python: $(python --version)"
+        else
+          echo "❌ No Python found. This action requires Python to be pre-installed on the runner."
+          exit 1
+        fi
+        
+        echo "PYTHON_CMD=$PYTHON_CMD" >> $GITHUB_ENV
+        
+        # Check if pip is available
+        if $PYTHON_CMD -m pip --version >/dev/null 2>&1; then
+          echo "✅ pip is available: $($PYTHON_CMD -m pip --version)"
+        elif command -v pip3 >/dev/null 2>&1; then
+          echo "✅ pip3 is available: $(pip3 --version)"
+        elif command -v pip >/dev/null 2>&1; then
+          echo "✅ pip is available: $(pip --version)"
+        else
+          echo "📦 pip not found, attempting to install without root..."
+          
+          # Try to install pip using get-pip.py (user installation)
+          echo "🔧 Installing pip via get-pip.py..."
+          if command -v curl >/dev/null 2>&1; then
+            curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            $PYTHON_CMD get-pip.py --user --no-warn-script-location
+            rm get-pip.py
+          elif command -v wget >/dev/null 2>&1; then
+            wget -q https://bootstrap.pypa.io/get-pip.py
+            $PYTHON_CMD get-pip.py --user --no-warn-script-location
+            rm get-pip.py
+          else
+            echo "❌ Cannot install pip - no curl or wget available"
+            echo "💡 Please ensure pip is pre-installed on your runner image"
+            exit 1
+          fi
+          
+          # Add user pip binary to PATH
+          if [ -d "$HOME/.local/bin" ]; then
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+        fi
+        
+        # Verify pip is working
+        echo "🔍 Verifying pip installation..."
+        if $PYTHON_CMD -m pip --version >/dev/null 2>&1; then
+          echo "✅ pip verification successful: $($PYTHON_CMD -m pip --version)"
+        else
+          echo "❌ pip verification failed"
+          exit 1
+        fi
+
+    - name: Install Python packages
+      shell: bash
+      run: |
+        set -e
+        
+        PYTHON_CMD="${PYTHON_CMD:-python3}"
+        echo "📦 Installing required Python packages..."
+        
+        # Create a temporary directory for package installation
+        TEMP_DIR=$(mktemp -d)
+        echo "Using temporary directory: $TEMP_DIR"
+        
+        # Install packages to user directory
+        echo "🔧 Installing PyJWT, cryptography, and requests..."
+        $PYTHON_CMD -m pip install --user --no-cache-dir --disable-pip-version-check \
+          PyJWT==2.8.0 \
+          cryptography>=3.4.8 \
+          requests>=2.25.1
+        
+        echo "✅ Packages installed successfully"
+        
+        # Verify packages are importable
+        echo "🔍 Verifying package installation..."
+        $PYTHON_CMD -c "
+        import sys
+        try:
+            import jwt
+            print(f'✅ PyJWT imported successfully (version: {jwt.__version__})')
+        except ImportError as e:
+            print(f'❌ Failed to import PyJWT: {e}')
+            sys.exit(1)
+
+        try:
+            import cryptography
+            print(f'✅ cryptography imported successfully (version: {cryptography.__version__})')
+        except ImportError as e:
+            print(f'❌ Failed to import cryptography: {e}')
+            sys.exit(1)
+
+        try:
+            import requests
+            print(f'✅ requests imported successfully (version: {requests.__version__})')
+        except ImportError as e:
+            print(f'❌ Failed to import requests: {e}')
+            sys.exit(1)
+
+        print('🎉 All packages verified successfully')
+        "
+
+    - name: Generate token
+      id: token
+      shell: bash
+      run: |
+        set -e
+        
+        PYTHON_CMD="${PYTHON_CMD:-python3}"
+        
+        $PYTHON_CMD << 'EOF'
+        import os, time, jwt, requests, sys
+        
+        print("🔧 Starting GitHub App token generation...")
+        
+        try:
+            app_id = os.environ["APP_ID"]
+            installation_id = os.environ["INSTALLATION_ID"]
+            private_key = os.environ["PRIVATE_KEY"].replace("\\n", "\n")
+            
+            print(f"📋 App ID: {app_id}")
+            print(f"📋 Installation ID: {installation_id}")
+            print(f"📋 Private key length: {len(private_key)} characters")
+
+            # Create JWT payload
+            now = int(time.time())
+            payload = {
+                "iat": now - 60,  # Issued 60 seconds ago to account for clock skew
+                "exp": now + 600,  # Expires in 10 minutes
+                "iss": app_id
+            }
+
+            print("🔐 Encoding JWT...")
+            encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
+            print("✅ JWT encoded successfully")
+
+            # Make API request
+            headers = {
+                "Authorization": f"Bearer {encoded_jwt}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "GitHub-Actions-Runner"
+            }
+            
+            url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+            print(f"🌐 Making request to: {url}")
+            
+            response = requests.post(url, headers=headers, timeout=30)
+            print(f"📡 Response status: {response.status_code}")
+            
+            if response.status_code != 201:
+                print(f"❌ API Error: {response.status_code}")
+                print(f"Response: {response.text}")
+                sys.exit(1)
+                
+            response.raise_for_status()
+            token_data = response.json()
+            token = token_data["token"]
+            
+            print(f"✅ Token generated successfully")
+            print(f"📋 Token length: {len(token)} characters")
+            print(f"📅 Token expires at: {token_data.get('expires_at', 'unknown')}")
+            
+            # Write to GITHUB_OUTPUT
+            github_output_path = os.environ.get("GITHUB_OUTPUT")
+            if not github_output_path:
+                print("❌ GITHUB_OUTPUT environment variable not set")
+                sys.exit(1)
+                
+            with open(github_output_path, "a") as github_output:
+                github_output.write(f"token={token}\n")
+            print("✅ Token written to GITHUB_OUTPUT")
+            
+        except Exception as e:
+            print(f"❌ Error generating token: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        EOF
+      env:
+        APP_ID: ${{ inputs.app_id }}
+        INSTALLATION_ID: ${{ inputs.installation_id }}
+        PRIVATE_KEY: ${{ inputs.private_key }}
+
+    - name: Verify token output
+      shell: bash
+      run: |
+        if [ -n "${{ steps.token.outputs.token }}" ]; then
+          echo "✅ Token output verification successful"
+          echo "📋 Token length: ${#TOKEN}"
+        else
+          echo "❌ Token output is empty or not set"
+          echo "🔍 Debugging information:"
+          echo "GITHUB_OUTPUT path: $GITHUB_OUTPUT"
+          if [ -f "$GITHUB_OUTPUT" ]; then
+            echo "GITHUB_OUTPUT contents:"
+            cat "$GITHUB_OUTPUT"
+          else
+            echo "GITHUB_OUTPUT file not found"
+          fi
+          exit 1
+        fi
+      env:
+        TOKEN: ${{ steps.token.outputs.token }}
